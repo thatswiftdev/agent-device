@@ -15,6 +15,7 @@ import {
 import {
   assertRunnerRequestActive,
   isRetryableRunnerError,
+  isRunnerBusyRejection,
   resolveRunnerRequestSignal,
   shouldRetryRunnerConnectError,
   withRunnerCommandId,
@@ -320,7 +321,7 @@ export async function executeRunnerCommand(
         recoveredDiagnosticPhase: 'ios_runner_readiness_preflight_recovered',
       });
     }
-    if (session && isRetryableRunnerError(appErr)) {
+    if (session && isRetryableRunnerError(appErr) && !isRunnerBusyRejection(appErr)) {
       return await handleRunnerTransportErrorAfterCommandSend({
         device,
         session,

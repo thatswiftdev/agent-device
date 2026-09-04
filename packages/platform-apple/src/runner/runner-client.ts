@@ -1,4 +1,4 @@
-import { retryWithPolicy, emitDiagnostic } from './host.ts';
+import { retryWithPolicy, emitDiagnostic, Deadline } from './host.ts';
 import { isIosFamily, type DeviceInfo } from '@agent-device/kernel/device';
 import {
   ensureRunnerSession,
@@ -8,6 +8,7 @@ import {
 import {
   assertRunnerRequestActive,
   isRetryableRunnerError,
+  isRunnerBusyRejection,
   withRunnerCommandId,
   type RunnerCommand,
 } from './runner-contract.ts';
@@ -30,6 +31,11 @@ import { RUNNER_COMMAND_TIMEOUT_MS } from './runner-transport.ts';
 
 // --- Runner command execution ---
 
+/** Resend budget for RUNNER_BUSY rejections: covers the runner's busy
+ *  window (abandoned main-thread work self-declares wedged at 120s) within
+ *  the standard command timeout. */
+const RUNNER_BUSY_RESEND_BUDGET_MS = Math.min(120_000, RUNNER_COMMAND_TIMEOUT_MS);
+
 export async function runAppleRunnerCommand(
   device: DeviceInfo,
   command: RunnerCommand,
@@ -39,21 +45,35 @@ export async function runAppleRunnerCommand(
   assertRunnerRequestActive(options.requestId);
   const runnerCommand = withRunnerCommandId(command);
   const provider = resolveAppleRunnerRuntime(device, options);
-  if (isReadOnlyRunnerCommand(runnerCommand.command)) {
-    return retryWithPolicy(
-      () => {
+  const readOnly = isReadOnlyRunnerCommand(runnerCommand.command);
+  // Busy-rejection budget: the runner reports busy while its main thread
+  // grinds abandoned work and self-declares wedged only after 120s
+  // (mainThreadWedgeThreshold). Default retry policy (3 x 200ms) exhausts
+  // in under a second — inside the busy window. A mutating command whose
+  // busy window outlives this deadline fails with the busy rejection
+  // intact (read-only keeps the wider retryable set through recovery).
+  const busyDeadline = Deadline.fromTimeoutMs(RUNNER_BUSY_RESEND_BUDGET_MS);
+  return retryWithPolicy(
+    () => {
+      assertRunnerRequestActive(options.requestId);
+      return provider.runCommand(device, runnerCommand, options);
+    },
+    {
+      maxAttempts: 30,
+      baseDelayMs: 1_000,
+      maxDelayMs: 10_000,
+      shouldRetry: (error) => {
         assertRunnerRequestActive(options.requestId);
-        return provider.runCommand(device, runnerCommand, options);
+        // Read-only commands resend on any retryable class. A MUTATING
+        // command resends ONLY on a rejection proven to precede execution
+        // (RUNNER_BUSY) — transport-loss classes may have already run the
+        // command, and a blind resend would double-tap.
+        if (readOnly) return isRetryableRunnerError(error);
+        return isRunnerBusyRejection(error);
       },
-      {
-        shouldRetry: (error) => {
-          assertRunnerRequestActive(options.requestId);
-          return isRetryableRunnerError(error);
-        },
-      },
-    );
-  }
-  return provider.runCommand(device, runnerCommand, options);
+    },
+    { deadline: busyDeadline },
+  );
 }
 
 export async function notifyIosRunnerAppRelaunched(

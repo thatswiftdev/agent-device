@@ -139,6 +139,8 @@ type RunnerErrorMatch = {
   code?: string;
   /** Every entry must appear in the lowercased message. */
   messageIncludesAll?: readonly string[];
+  /** Required `error.details.runnerErrorCode` (typed runner rejection class). */
+  runnerErrorCode?: string;
   /** Required details evidence beyond code/message. */
   details?: 'retriable' | 'usbmux-device-unattached';
 };
@@ -152,6 +154,9 @@ type RunnerErrorVerdicts = {
   sessionFatalReason?: string;
   /** Connect-shaped failure before the command was sent: restart the session and replay. */
   restartBeforeSend?: boolean;
+  /** Rejection proven to precede execution (RUNNER_BUSY): a resend of a
+   *  MUTATING command is safe — the refused command never started. */
+  resendMutations?: boolean;
 };
 
 type RunnerErrorRule = {
@@ -181,6 +186,15 @@ export const RUNNER_ERROR_RULES: readonly RunnerErrorRule[] = [
     reason: 'flagged_retriable',
     match: { code: 'COMMAND_FAILED', details: 'retriable' },
     verdicts: { retryable: true },
+  },
+  {
+    // The runner answered and REFUSED the command before executing it
+    // (details.runnerErrorCode === 'RUNNER_BUSY'): the command provably
+    // never started, so a resend is safe for mutating commands too — unlike
+    // transport-loss classes where the command may have run (double-tap risk).
+    reason: 'runner_busy_rejected_before_execution',
+    match: { code: 'COMMAND_FAILED', runnerErrorCode: 'RUNNER_BUSY' },
+    verdicts: { retryable: true, resendMutations: true },
   },
   {
     reason: 'xcodebuild_exited_early',
@@ -235,7 +249,13 @@ export const RUNNER_ERROR_RULES: readonly RunnerErrorRule[] = [
 function matchesRunnerErrorRule(error: AppError, match: RunnerErrorMatch): boolean {
   if (match.code !== undefined && error.code !== match.code) return false;
   if (!matchesRunnerErrorDetails(error, match.details)) return false;
+  if (!matchesRunnerErrorCode(error, match.runnerErrorCode)) return false;
   return matchesRunnerErrorMessage(error, match.messageIncludesAll);
+}
+
+function matchesRunnerErrorCode(error: AppError, runnerErrorCode: string | undefined): boolean {
+  if (!runnerErrorCode) return true;
+  return (error.details as { runnerErrorCode?: unknown } | undefined)?.runnerErrorCode === runnerErrorCode;
 }
 
 function matchesRunnerErrorDetails(error: AppError, details: RunnerErrorMatch['details']): boolean {
@@ -260,6 +280,12 @@ function runnerErrorVerdict<Axis extends keyof RunnerErrorVerdicts>(
     if (matchesRunnerErrorRule(error, rule.match)) return rule.verdicts[axis];
   }
   return undefined;
+}
+
+/** Rejection proven to precede execution — safe to resend even a mutating
+ *  command (the refused command never started; no double-tap risk). */
+export function isRunnerBusyRejection(err: unknown): boolean {
+  return runnerErrorVerdict(err, 'resendMutations') ?? false;
 }
 
 export function isRetryableRunnerError(err: unknown): boolean {

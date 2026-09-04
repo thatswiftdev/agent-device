@@ -1278,3 +1278,64 @@ test('a later command in the same request cannot pay for a second recycle boot',
   );
   assert.equal(mockEnsureRunnerSession.mock.calls.length, 2);
 });
+
+// --- RUNNER_BUSY mutation resend (engine-side wedge fix) ---
+// The runner refuses commands while its previous one is still finishing
+// (typed details.runnerErrorCode = 'RUNNER_BUSY'). That refusal PRECEDES
+// execution, so resending a mutating command (tap) is provably safe; a
+// transport-loss class is NOT (the command may have run — double-tap risk).
+
+function makeBusyRejection(): AppError {
+  return new AppError('COMMAND_FAILED', 'The iOS runner is still finishing a previous command', {
+    runnerErrorCode: 'RUNNER_BUSY',
+    retriable: true,
+  });
+}
+
+test('runAppleRunnerCommand resends a MUTATING command on a RUNNER_BUSY rejection', async () => {
+  mockEnsureRunnerSession.mockResolvedValue(makeRunnerSession());
+  mockExecuteRunnerCommandWithSession
+    .mockRejectedValueOnce(makeBusyRejection())
+    .mockResolvedValueOnce({ tapped: { x: 147, y: 649 } });
+
+  const result = await runAppleRunnerCommand(IOS_SIMULATOR, { command: 'tap', x: 147, y: 649 });
+
+  assert.deepEqual(result, { tapped: { x: 147, y: 649 } });
+  assert.equal(mockExecuteRunnerCommandWithSession.mock.calls.length, 2);
+});
+
+test('runAppleRunnerCommand does NOT resend a mutating command on a generic retryable transport error', async () => {
+  mockEnsureRunnerSession.mockResolvedValue(makeRunnerSession());
+  mockExecuteRunnerCommandWithSession.mockRejectedValue(
+    new AppError('COMMAND_FAILED', 'fetch failed'),
+  );
+
+  await assert.rejects(
+    runAppleRunnerCommand(IOS_SIMULATOR, { command: 'tap', x: 1, y: 2 }),
+  );
+  // Only ONE tap dispatch. (A status probe may follow as recovery — that is
+  // not a resend; every tap-shaped call must be the original alone.)
+  const tapDispatches = mockExecuteRunnerCommandWithSession.mock.calls.filter(
+    (call) => (call[2] as { command?: string }).command === 'tap',
+  );
+  assert.equal(tapDispatches.length, 1);
+});
+
+test('runAppleRunnerCommand still resends read-only commands on any retryable class', async () => {
+  mockEnsureRunnerSession.mockResolvedValue(makeRunnerSession());
+  mockExecuteRunnerCommandWithSession
+    .mockRejectedValueOnce(new AppError('COMMAND_FAILED', 'fetch failed'))
+    // recovery status probe: read-only in-flight → recovery returns the
+    // original transport error (retryable) → retryWithPolicy resends
+    .mockResolvedValueOnce({ lifecycleState: 'started' })
+    // the resend
+    .mockResolvedValueOnce({ nodes: [] });
+
+  const result = await runAppleRunnerCommand(IOS_SIMULATOR, { command: 'snapshot' });
+
+  assert.deepEqual(result, { nodes: [] });
+  const snapshotDispatches = mockExecuteRunnerCommandWithSession.mock.calls.filter(
+    (call) => (call[2] as { command?: string }).command === 'snapshot',
+  );
+  assert.equal(snapshotDispatches.length, 2); // original + one resend
+});
